@@ -55,12 +55,19 @@ void setup() {
 
 
 /* IDEAS
- - SPLINES https://github.com/snsinfu/cxx-spline
+ - MIRROR MODE
+  - you can do whatever on the full canvas, but after all your drawing, half the canvas gets mirrored onto the other half
+ - SPLINES https://github.com/ejmahler/SplineLibrary
   - one spline equals one curve or hollow shape. thickness var when drawing
-  - draw by sampling the spline a number of times proportional to the distance between knots, drawing the corresponding pixel (might redraw)
-  - optionally floodfill? draw spline, draw line connecting endpoints to make closed, fill in space? floodfill def needs to be a draw-buffer operation
+  - draw by sampling the spline a number of times proportional to the arc length (that's an existing util function), drawing the corresponding pixel (might redraw)
+  - optionally floodfill for looping splines? draw spline, fill in space? floodfill def needs to be a draw-buffer operation
   - animate by moving spline knots? You could spline to interpolate between keyframes for knots positions lmao. Double spline ^^
-  - 
+ - PIXEL CELLULAR AUTOMATA
+  - falling sand
+  - water sloshing
+  - target gravity (pixels gravitate to or around a point)
+ - TRANSITIONS
+  - stop drawing splines, convert existing buffer to cellular automata, gravity/flow down or something
 */
 void loop() {
     int i;
@@ -96,6 +103,7 @@ void loop() {
         switch (random(15)) {
         case 0:
             backgroundLayer.drawPixel(x0, y0, outlineColor);
+            // backgroundLayer.readPixel(x0, y0);
             break;
 
         case 1:
