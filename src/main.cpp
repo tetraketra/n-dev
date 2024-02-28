@@ -65,6 +65,7 @@ void setup() {
  - PIXEL CELLULAR AUTOMATA
   - falling sand
   - water sloshing
+  - rock paper scissors
   - target gravity (pixels gravitate to or around a point)
  - TRANSITIONS
   - stop drawing splines, convert existing buffer to cellular automata, gravity/flow down or something
