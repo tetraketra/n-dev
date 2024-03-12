@@ -1,5 +1,6 @@
 {
     "files.associations": {
-        "gimpbitmap.h": "c"
+        "gimpbitmap.h": "c",
+        "random": "cpp"
     }
 }
