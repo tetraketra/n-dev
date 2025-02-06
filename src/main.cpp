@@ -9,7 +9,7 @@ const uint16_t kMatrixHeight  = 64;  // Set to the height of your display
 const uint8_t kRefreshDepth   = 36;  // Tradeoff of color quality vs refresh rate, max brightness, and RAM usage.  36 is typically good, drop down to 24 if you need to.  On Teensy, multiples of 3, up to 48: 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48.  On ESP32: 24, 36, 48
 const uint8_t kDmaBufferRows  = 4;   // known working: 2-4, use 2 to save RAM, more to keep from dropping frames and automatically lowering refresh rate.  (This isn't used on ESP32, leave as default)
 const uint8_t kPanelType = SM_PANELTYPE_HUB75_32ROW_MOD16SCAN; // Choose the configuration that matches your panels.  See more details in MatrixCommonHub75.h and the docs: https://github.com/pixelmatix/SmartMatrix/wiki
-const uint32_t kMatrixOptions = (SM_HUB75_OPTIONS_BOTTOM_TO_TOP_STACKING && SM_HUB75_OPTIONS_ESP32_INVERT_CLK); // (SM_HUB75_OPTIONS_NONE);       // see docs for options: https://github.com/pixelmatix/SmartMatrix/wiki
+const uint32_t kMatrixOptions = (SM_HUB75_OPTIONS_BOTTOM_TO_TOP_STACKING & SM_HUB75_OPTIONS_ESP32_INVERT_CLK); // (SM_HUB75_OPTIONS_NONE);       // see docs for options: https://github.com/pixelmatix/SmartMatrix/wiki
 const uint8_t kBackgroundLayerOptions = (SM_BACKGROUND_OPTIONS_NONE);
 const uint8_t kScrollingLayerOptions = (SM_SCROLLING_OPTIONS_NONE);
 const uint8_t kIndexedLayerOptions = (SM_INDEXED_OPTIONS_NONE);
@@ -24,21 +24,24 @@ SMARTMATRIX_ALLOCATE_INDEXED_LAYER(indexedLayer, kMatrixWidth, kMatrixHeight, CO
 
 /* --- --- --- --- IR Remote Defs --- --- --- --- */
 
-// #define USE_NO_SEND_PWM
-
 #define SUPPRESS_ERROR_MESSAGE_FOR_BEGIN
 #include <IRremote.hpp>
 
-#define IR_RECEIVE_PIN 8
-#define IR_DEBUG false // true to send debug info to serial output (useful for setting command #s with new controller)
+#define IR_RECEIVE_PIN 8 // Make sure to use a pin that isn't taken by the SmartMatrix LED shield!
+#define IR_IS_GOOD_INPUT IrReceiver.repeatCount == 0 && IrReceiver.decodedIRData.decodedRawData != 0
 
+struct IrConfig {
+    static inline bool debug; // Whether to send debug info to serial output (useful for setting up a new controller).
+    static inline constexpr uint16_t commandDebugToggle = 0x44;
+    static inline constexpr uint16_t commandPowerToggle = 0x8;
+};
 
 /* --- --- --- --- --- --- --- ---  */
 
 void setup() {
 
     /* SmartMatrix Setup */
-    pinMode(13, OUTPUT);
+    pinMode(13, OUTPUT); // Always pin 13; can't change it.
 
     matrix.addLayer(&backgroundLayer); 
     matrix.addLayer(&indexedLayer); 
@@ -52,9 +55,11 @@ void setup() {
     while (!Serial && millis() < 3000) { /* ... */}
 
     /* IR Remote Setup */
-    pinMode(8, INPUT);
+    pinMode(IR_RECEIVE_PIN, INPUT);
 
     IrReceiver.begin(IR_RECEIVE_PIN, DISABLE_LED_FEEDBACK);
+
+    IrConfig::debug = false; // Overwride default debug state if needed (e.g. on new controller to get cmd#s).
 }
 
 void loop() {
@@ -64,12 +69,20 @@ void loop() {
 
     /* IR Remote Receiving */
     if (IrReceiver.decode()) {
-        IrReceiver.printIRResultShort(&Serial);
-        IrReceiver.printIRResultAsCVariables(&Serial);
+        if (IR_IS_GOOD_INPUT) {
+            if (IrConfig::debug) {
+                IrReceiver.printIRResultShort(&Serial);
+                IrReceiver.printIRResultAsCVariables(&Serial);
+            }
+            
+            if (IrReceiver.decodedIRData.command == IrConfig::commandDebugToggle) {
+                Serial.printf("Debug %s.\n\n", (IrConfig::debug) ? "disabled" : "enabled");
+                IrConfig::debug ^= true;
+            }
+        }
+
         IrReceiver.resume();
     }
-
-    // Serial.println("HELLO THERE :V\n");
 }
 
 
