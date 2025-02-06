@@ -1,6 +1,7 @@
 #ifndef HSV_HPP
 #define HSV_HPP
 
+// #include "SmartMatrix/SmartMatrix.h"
 #include <SmartMatrix.h>
 
 typedef struct hsv24{

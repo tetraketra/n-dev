@@ -1,0 +1,2 @@
+http://docs.pixelmatix.com/SmartMatrix/library.html # library overview
+http://docs.pixelmatix.com/SmartMatrix/shield-t4.html # relevant specs
