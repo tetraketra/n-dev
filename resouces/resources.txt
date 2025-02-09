@@ -1,0 +1,11 @@
+http://docs.pixelmatix.com/SmartMatrix/library.html # library overview
+http://docs.pixelmatix.com/SmartMatrix/shield-t4.html # relevant specs
+https://javl.github.io/image2cpp/ # png to includable for PNGdec
+`xxd -i filename.png > filename.h` # C array! 
+
+# You can add a very small amount of natural bloom via asprite transparency, 
+  then use use `+` and `-` buttons to scale the mixing, bringing that up to 
+  (at most) max color. 
+# I recommend going over parts of the sprite with a large-size 15% opacity
+  blur (Blur Tool) quite a few times until you can see that the least opaque
+  pixes extend 1-2 pixels away. Small font 1 pixel, large font 2 pixels.

@@ -1,16 +1,15 @@
 #ifndef HSV_HPP
 #define HSV_HPP
 
-// #include "SmartMatrix/SmartMatrix.h"
 #include <SmartMatrix.h>
 
-typedef struct hsv24{
+typedef struct hsv24 {
     unsigned char h; /* 0-255 not 0-360 */
     unsigned char s;
     unsigned char v;
 } hsv24;
 
-rgb24 HsvToRgb(hsv24 hsv)
+rgb24 hsvToRgb(hsv24 hsv)
 {
     rgb24 rgb;
     unsigned char region, remainder, p, q, t;
@@ -53,6 +52,39 @@ rgb24 HsvToRgb(hsv24 hsv)
     }
     
     return rgb;
+}
+
+hsv24 rgbToHsv(rgb24 rgb)
+{
+    hsv24 hsv;
+    unsigned char rgbMin, rgbMax;
+
+    rgbMin = rgb.red < rgb.green ? (rgb.red < rgb.blue ? rgb.red : rgb.blue) : (rgb.green < rgb.blue ? rgb.green : rgb.blue);
+    rgbMax = rgb.red > rgb.green ? (rgb.red > rgb.blue ? rgb.red : rgb.blue) : (rgb.green > rgb.blue ? rgb.green : rgb.blue);
+    
+    hsv.v = rgbMax;
+    if (hsv.v == 0)
+    {
+        hsv.h = 0;
+        hsv.s = 0;
+        return hsv;
+    }
+
+    hsv.s = 255 * long(rgbMax - rgbMin) / hsv.v;
+    if (hsv.s == 0)
+    {
+        hsv.h = 0;
+        return hsv;
+    }
+
+    if (rgbMax == rgb.red)
+        hsv.h = 0 + 43 * (rgb.green - rgb.blue) / (rgbMax - rgbMin);
+    else if (rgbMax == rgb.green)
+        hsv.h = 85 + 43 * (rgb.blue - rgb.red) / (rgbMax - rgbMin);
+    else
+        hsv.h = 171 + 43 * (rgb.red - rgb.green) / (rgbMax - rgbMin);
+
+    return hsv;
 }
 
 #endif
