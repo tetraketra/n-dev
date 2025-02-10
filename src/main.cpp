@@ -55,25 +55,41 @@ namespace IRConfig {
 #include "include/PNGdec/PNGdec.h"
 
 typedef struct PNGDrawArgs {
-    float bloomScale; // Needed for PNGDec. I can't just give it N's bloomScale directly.
+    float bloomScale;
+    bool  debug;
+    bool  doTransparency; // If `true`, treats all non-trans pixels as *fully* opaque. If `false`, mixes with black. Combine with `doBlack` to control behavior.
+    bool  doBlack; // Whether to draw black pixels. Saves work sometimes when cobined iwth `doTransparency=false`.
+    // NOTE LOOKATME: I need to figure out color mixing!
 } PRIVATE;
 
 namespace PNGHandler {
     PNG png;
 
+    /* Draws one line. `<PNGdec>` calls this for each line in the PNG on `png.decode()`. */
     void PNGDraw(PNGDRAW *pDraw) {
-        PRIVATE *pPriv = (PRIVATE *)pDraw->pUser;
-        uint16_t pixelsRow[64]; // image width is 64
+        PRIVATE *pPriv = (PRIVATE *)pDraw->pUser; // IDK if I can change these names? Cpp is weird. 
+        uint16_t pixelsRow[64]; // image width is *always* 64.
+        uint8_t  pixelsOpaque[8];
     
-        png.getLineAsRGB565(pDraw, pixelsRow, PNG_RGB565_LITTLE_ENDIAN, 0x00000000); // With 0xffffffff, all non-zero transparencies of a given color are that color, and `png.getAlphaMask(...)` works. With 0x00000000, every pixel gets mixed with black to include transparency as a color modifier (such as in dimmed bloom pixels). Might want to pass in a `doTransparency` arg via the `PRIVATE` struct to only selectively use this behavior. Drawing on top of without entirely erasing the scene isn't possible with 0x00000000.
+        /* Fetch line information. */
+        png.getLineAsRGB565(pDraw, pixelsRow, PNG_RGB565_LITTLE_ENDIAN, (pPriv->doTransparency) ? 0xFFFFFFFF : 0x00000000); // With 0xFFFFFFFF, all non-zero transparencies of a given color are that color, and `png.getAlphaMask(...)` works. With 0x00000000, every pixel gets mixed with black to include transparency as a color modifier (such as in dimmed bloom pixels). Might want to pass in a `doTransparency` arg via the `PRIVATE` struct to only selectively use this behavior. Drawing on top of without entirely erasing the scene isn't possible with 0x00000000.
+        if (!png.getAlphaMask(pDraw, pixelsOpaque, 0)) { // Color mixing can turn transparency into black, which counts as non-opaque!
+            return; // Skip row if no pixels.
+        }
+
+        /* Draw line. */
         for (size_t x = 0; x < 64; x++) {
-            uint16_t rgb565pixel = pixelsRow[x];
-    
-            if (rgb565pixel == 0) { 
-                continue; // Skip black pixels. See the long comment about 0xffffffff and 0x00000000.
+            if (pPriv->doTransparency && !((pixelsOpaque[x/8] >> (7 - x%8)) & 1)) {
+                continue; // Skip pixel if we're drawing transparency and this pixel is transparent.
             }
-    
+
+            if (!pPriv->doBlack && !pixelsRow[x]) {
+                continue; // Skip pixel if we're not drawing black and this pixel is black.
+            }
+
             /* Recompose as rgb24. */
+            uint16_t rgb565pixel = pixelsRow[x];
+
             uint8_t blue =  ( rgb565pixel        & 0x1F) << 3;
             uint8_t green = ((rgb565pixel >> 5)  & 0x3F) << 2;
             uint8_t red =   ((rgb565pixel >> 11) & 0x1F) << 3;
@@ -120,23 +136,78 @@ namespace SDHandler {
     }
 };
 
+/* --- --- --- --- Animation Defs --- --- --- --- */
+
+struct AnimHandler {
+    char name[32] = {0}; // Used to search file structure, so be consistent.
+    char folderPath[128] = {0}; // animations/{name}/
+    char basePath[12] = "animations/"; // Has the forward slash!
+    int  curFrame = 0;
+
+    void init(const char* animName) {
+        strcpy(name, animName);
+
+        strcpy(folderPath, basePath);
+        strcat(folderPath, animName);
+        strcat(folderPath, "/"); // animations/{name}/
+    }
+
+    void drawNextFrame(PRIVATE args) {
+        /* Create path of next-to-be-drawn frame file. */
+        char framePath[128] = {0};
+        strcpy(framePath, folderPath);
+        strcat(framePath, name); // animations/{anim}/{anim}
+
+        curFrame++;
+        char frameNum[16] = {0};
+        itoa(curFrame, frameNum, 10);
+        strcat(framePath, frameNum);
+        strcat(framePath, ".png"); // animations/{anim}/{anim}{frameNum}.png
+
+        /* Revert back to frame #1 if at the end of the animation. */
+        if (!SD.exists(framePath)) {
+            if (args.debug) {
+                Serial.printf("No \"%s\". Rewinding animation \"%s\".\n", framePath, folderPath);
+            }
+
+            framePath[128] = {0};
+            strcpy(framePath, folderPath);
+            strcat(framePath, name); // /animations/{anim}/{anim}
+
+            curFrame = 1;
+            char frameNum[16] = {0};
+            itoa(curFrame, frameNum, 10);
+            strcat(framePath, frameNum);
+            strcat(framePath, ".png"); // /animations/{anim}/{anim}1.png
+        }
+        
+        /* Draw from frame file path. */
+        PNGHandler::png.close();
+        PNGHandler::png.open((const char*)framePath, SDHandler::sdOpen, SDHandler::sdClose, SDHandler::sdRead, SDHandler::sdSeek, PNGHandler::PNGDraw);
+        PNGHandler::png.decode((void *)&args, 0);
+    }
+};
+
+AnimHandler testSuite; // NOTE LOOKATME
+AnimHandler testSpeed; // NOTE LOOKATME
+
 /* --- --- --- --- N Defs --- --- --- --- */
 
 namespace N {
     enum modes {
-        NCFG_M_OFF,
+        NCFG_M_MIN,
         NCFG_M_KNOCKEDTFOUT,
         NCFG_M_TESTING_SUITE,
         NCFG_M_TESTING_SPEED,
         NCFG_M_MAX,
     } modes;
 
-    int mode;
+    int mode = NCFG_M_KNOCKEDTFOUT;
     int mode_prev;
 
     const char* mode_to_string(int mode) {
         switch (mode) {
-            case modes::NCFG_M_OFF: return "NCFG_M_OFF";
+            case modes::NCFG_M_MIN: return "NCFG_M_MIN";
             case modes::NCFG_M_KNOCKEDTFOUT: return "NCFG_M_KNOCKEDTFOUT";
             case modes::NCFG_M_TESTING_SUITE: return "NCFG_M_TESTING_SUITE";
             case modes::NCFG_M_TESTING_SPEED: return "NCFG_M_TESTING_SPEED";
@@ -147,78 +218,15 @@ namespace N {
     bool debug;
     bool displayOn;
 
-    namespace anim {
-        constexpr char  basePath[] = "animations/"; // Has the forward slash!
-                  char  curPath[128]; // Folder within `animations/` 
-                  char  curName[64];
-                  float bloomScale = 0.0; // `0.0` represents whatever the PNG actually has from asprite blurring. `1.0` maxes every transparent pixel fully opaque.
+    namespace display {
+        float bloomScale = 0.0; // `0.0` represents whatever the PNG actually has from asprite blurring. `1.0` maxes every transparent pixel fully opaque.
         
         namespace frame {
-            constexpr uint32_t millisPer = 1000/24;
-                      uint32_t millisLastAt;
-                      uint32_t millisSinceLast;
-                      float    tooSlowAlert = (float)90/100;
-                      int      curNum; // animations/{anim}/{anim}{curNum}.png // 1-indexed for name consistency reasons!
+            uint32_t millisPer = 1000/24;
+            uint32_t millisLastAt;
+            uint32_t millisSinceLast;
+            float    tooSlowAlert = (float)90/100;
         };
-
-        void run(PRIVATE args, const char* animName) {
-            
-            /* Handle animation switching. */
-            if (strcmp(animName, N::anim::curName)) {
-                /* Update current animation name. */
-                memset(N::anim::curName, 0, sizeof(N::anim::curName)); // update current animation name
-                strcpy(N::anim::curName, animName);
-    
-                /* Update current animation path. */
-                memset(N::anim::curPath, 0, sizeof(N::anim::curPath)); // update current animation path
-                strcpy(N::anim::curPath, N::anim::basePath);
-                strcat(N::anim::curPath, N::anim::curName);
-                strcat(N::anim::curPath, "/"); // animations/{anim}/
-                
-                /* Reset stuff. */
-                PNGHandler::png.close();
-                N::anim::frame::curNum = 0; // Start on an invalid 0th frame so following code advances to the valid 1st.
-            
-                /* Debug. */
-                if (N::debug) {
-                    Serial.printf("Starting animation \"%s\".\n", N::anim::curPath);
-                }
-            }
-    
-            /* Create path of next-to-be-drawn frame file. */
-            char framePath[128] = {0};
-            strcpy(framePath, N::anim::curPath);
-            strcat(framePath, N::anim::curName); // animations/{anim}/{anim}
-    
-            N::anim::frame::curNum++;
-            char frameNum[16] = {0};
-            itoa(N::anim::frame::curNum, frameNum, 10);
-            strcat(framePath, frameNum);
-            strcat(framePath, ".png"); // animations/{anim}/{anim}{frameNum}.png
-    
-            /* Revert back to frame #1 if at the end of the animation. */
-            if (!SD.exists(framePath)) {
-                if (N::debug) {
-                    Serial.printf("No \"%s\". Rewinding animation \"%s\".\n", framePath, N::anim::curPath);
-                }
-    
-                framePath[128] = {0};
-    
-                strcpy(framePath, N::anim::curPath);
-                strcat(framePath, N::anim::curName);
-    
-                N::anim::frame::curNum = 1;
-                char frameNum[16] = {0};
-                itoa(N::anim::frame::curNum, frameNum, 10);
-                strcat(framePath, frameNum);
-                strcat(framePath, ".png"); // /animations/{anim}/{anim}1.png
-            }
-            
-            /* Draw from frame file path. */
-            PNGHandler::png.close();
-            PNGHandler::png.open((const char*)framePath, SDHandler::sdOpen, SDHandler::sdClose, SDHandler::sdRead, SDHandler::sdSeek, PNGHandler::PNGDraw);
-            PNGHandler::png.decode((void *)&args, 0);
-        }
     };
 };
 
@@ -252,6 +260,10 @@ void setup() {
     /* N Defaults */
     N::debug = false; // Overwride default debug state if needed (e.g. on new controller to get cmd#s).
     N::mode = N::modes::NCFG_M_KNOCKEDTFOUT;
+
+    /* Animation Setup */
+    testSuite.init("test_suite");
+    testSpeed.init("test_speed");
 }
 
 void loop() {
@@ -275,12 +287,12 @@ void loop() {
             /* [In|de]crease bloom. */
             float bloomChanged = 0.0;
             if (IrReceiver.decodedIRData.command == IRConfig::commands::bloomUp) {
-                if (N::anim::bloomScale < 0.39) { 
-                    N::anim::bloomScale += (bloomChanged =  0.05); 
+                if (N::display::bloomScale < 0.39) { 
+                    N::display::bloomScale += (bloomChanged =  0.05); 
                 }
             } else if (IrReceiver.decodedIRData.command == IRConfig::commands::bloomDown) {
-                if (N::anim::bloomScale > 0.01) { 
-                    N::anim::bloomScale += (bloomChanged = -0.05); 
+                if (N::display::bloomScale > 0.01) { 
+                    N::display::bloomScale += (bloomChanged = -0.05); 
                 }
             }
 
@@ -288,7 +300,7 @@ void loop() {
                 Serial.printf(
                     "FakeBloom %s from %.2f%% to %.2f%%.\n", 
                     ((bloomChanged > 0) ? "increased" : "decreased"), 
-                    (N::anim::bloomScale - bloomChanged) * 100, N::anim::bloomScale * 100
+                    (N::display::bloomScale - bloomChanged) * 100, N::display::bloomScale * 100
                 );
             }
 
@@ -305,7 +317,7 @@ void loop() {
             /* Cycle mode. */
             if (IrReceiver.decodedIRData.command == IRConfig::commands::next && N::mode < N::modes::NCFG_M_MAX - 1) {
                 N::mode += 1;
-            } else if (IrReceiver.decodedIRData.command == IRConfig::commands::prev && N::mode > N::modes::NCFG_M_OFF + 1) {
+            } else if (IrReceiver.decodedIRData.command == IRConfig::commands::prev && N::mode > N::modes::NCFG_M_MIN + 1) {
                 N::mode -= 1;
             }
         }
@@ -316,22 +328,23 @@ void loop() {
     /* N Drawing w/ SmartMatrix */
     uint32_t curMillis = millis();
     PNGDrawArgs args = {
-        .bloomScale = N::anim::bloomScale // Needed for PNGDec. I can't just give it N's bloomScale directly.
+        .bloomScale = N::display::bloomScale,
+        .debug = N::debug,
     };
 
-    N::anim::frame::millisSinceLast = curMillis - N::anim::frame::millisLastAt;
-    if (N::anim::frame::millisSinceLast > N::anim::frame::millisPer - 1) { // Draw frame if it's been a bit.
-        N::anim::frame::millisLastAt = curMillis;
+    N::display::frame::millisSinceLast = curMillis - N::display::frame::millisLastAt;
+    if (N::display::frame::millisSinceLast > N::display::frame::millisPer - 1) { // Draw frame if it's been a bit.
+        N::display::frame::millisLastAt = curMillis;
 
         /* Debug print if been too long since last frame. */
-        if (N::debug && N::anim::frame::millisSinceLast > N::anim::frame::millisPer / N::anim::frame::tooSlowAlert) { 
+        if (N::debug && N::display::frame::millisSinceLast > N::display::frame::millisPer / N::display::frame::tooSlowAlert) { 
             Serial.printf(
                 "Frame rate dropped dangerously low! "
                 "Alert set at %.2f%%, maximally %u millis per frame. "
                 "Expected close to %u millis since last frame. Has been %u.\n", 
-                N::anim::frame::tooSlowAlert*100, 
-                N::anim::frame::millisPer / N::anim::frame::tooSlowAlert, 
-                N::anim::frame::millisPer, N::anim::frame::millisSinceLast
+                N::display::frame::tooSlowAlert*100, 
+                N::display::frame::millisPer / N::display::frame::tooSlowAlert, 
+                N::display::frame::millisPer, N::display::frame::millisSinceLast
             ); 
         }
 
@@ -352,17 +365,24 @@ void loop() {
             }
 
             case (N::modes::NCFG_M_TESTING_SUITE): { // animation on sd card example
-                N::anim::run(args, "test_suite");
+                testSuite.drawNextFrame(args);
                 break;
             }
 
-            case (N::modes::NCFG_M_TESTING_SPEED): {
-                N::anim::run(args, "test_speed");
+            case (N::modes::NCFG_M_TESTING_SPEED): { // animation on sd card with transparency and layers example
+                args.doBlack = true;
+                args.doTransparency = false;
+                testSpeed.drawNextFrame(args);
+
+                args.doBlack = false;
+                args.doTransparency = true;
+                testSuite.drawNextFrame(args);
+
                 break;
             }
     
-            /* Do nothing if `NCFG_M_OFF` or default. Intentional fallthrough. */
-            case (N::modes::NCFG_M_OFF):
+            /* Do nothing if `NCFG_M_MIN` or default. Intentional fallthrough. */
+            case (N::modes::NCFG_M_MIN):
             default: {
                 break;
             }
@@ -373,8 +393,6 @@ void loop() {
 
     /* Mode change. */
     if (N::mode != N::mode_prev) {
-        N::anim::frame::curNum = 0;
-
         if (N::debug) {
             Serial.printf(
                 "N mode changed from `%s` to `%s`.\n", 
