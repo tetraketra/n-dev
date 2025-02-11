@@ -1,7 +1,13 @@
 /* --- --- --- --- Msc Defs --- --- --- --- */
 
+#include <math.h>
+
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
+#define CLAMP(x, min, max) (MIN(MAX(x, min), max))
+#define RAND_SIGN() (random(2) == 0 ? -1 : 1) 
+#define RAND_WEIGHTED(magnitude) (int)(sqrt(random((int)pow((float)magnitude, 2.0)))) // Weighs the random towards 0.
+#define CHANCE(chance) ((chance == 0.0f) ? false : random(100) < chance*100) // Checks if the chance passes.
 
 /* --- --- --- --- SmartMatrix Defs --- --- --- --- */
 
@@ -47,43 +53,119 @@ namespace IRConfig {
     };
 };
 
+/* --- --- --- --- N Defs --- --- --- --- */
+
+namespace N {
+    enum modes {
+        NCFG_M_MIN,
+        NCFG_M_KNOCKEDTFOUT,
+        NCFG_M_TEST_CARD,
+        NCFG_M_TEST_ANIM,
+        NCFG_M_MAX,
+    } modes;
+
+    int mode = NCFG_M_KNOCKEDTFOUT;
+    int mode_prev;
+
+    const char* mode_to_string(int mode) {
+        switch (mode) {
+            case modes::NCFG_M_MIN: return "NCFG_M_MIN";
+            case modes::NCFG_M_KNOCKEDTFOUT: return "NCFG_M_KNOCKEDTFOUT";
+            case modes::NCFG_M_TEST_CARD: return "NCFG_M_TEST_CARD";
+            case modes::NCFG_M_TEST_ANIM: return "NCFG_M_TEST_ANIM";
+            default: return "!!Unknown Mode!!";
+        }
+    }
+
+    bool debug;
+    bool displayOn;
+
+    namespace display {
+        float bloomScale = 0.0; // `0.0` represents whatever the PNG actually has from asprite blurring. `1.0` maxes every transparent pixel fully opaque.
+        
+        namespace frame {
+            uint32_t millisPer = 1000/24;
+            uint32_t millisLastAt;
+            uint32_t millisSinceLast;
+            float    tooSlowAlert = (float)90/100;
+        };
+    };
+};
+
 /* --- --- --- --- PNG Printer Defs --- --- --- --- */
 
-#include "Nfaces/knockedtfout.h"
+#include "hardcoded_images/knockedtfout.h"
+#include "hardcoded_images/test_card.h"
 
 #include "include/hsv.hpp"
 #include "include/PNGdec/PNGdec.h"
 
-typedef struct PNGDrawArgs {
-    float bloomScale;
-    bool  debug;
-    bool  doTransparency; // If `true`, treats all non-trans pixels as *fully* opaque. If `false`, mixes with black. Combine with `doBlack` to control behavior.
-    bool  doBlack; // Whether to draw black pixels. Saves work sometimes when cobined iwth `doTransparency=false`.
-    // NOTE LOOKATME: I need to figure out color mixing!
-} PRIVATE;
+#define CHANCE_GLITCHHAPPENS(glitch) ((glitch.enabled) ? CHANCE(glitch.chance) : false)
 
-namespace PNGHandler {
+typedef struct Glitch {
+    bool  enabled; // Whether to do the glitch at all.
+    float chance;
+    int   magnitude;
+};
+
+typedef struct DrawArgs { // NOTE LOOKATME: I need to figure out color mixing!
+    int xOffset;
+    int yOffset;
+
+    float* bloomScale;
+    bool*  debug;
+    bool   mixBlack; // If `false`, treats all non-trans pixels as *fully* opaque. If `true`, mixes with black. Combine with `doBlack` to control behavior.
+    bool   drawBlack; // Whether to draw black pixels. Saves cycles sometimes when combined iwth `mixBlack=true`.
+    
+    struct { // TODO: Make the "looks nice" values defaults for glitches being on/off.
+        Glitch jitter; // Left-right jitter. `{. chance = 0.02f, .magnitude = 3 }` looks nice. 
+        Glitch chromatic; // Color alteration. `{ .chance = 0.02f, .magnitude = 80 }` loks nice.
+        Glitch desaturate; // Desaturation. `{ .chance = 0.02f, .magnitude = 80 }` looks nice.
+        Glitch fail; // Don't draw. `{ .chance = 0.02f, .magnitude = NOT_USED }` looks nice.
+    } glitches;
+} PRIVATE; // `PRIVATE` needed for `PNGdec::PNGDraw`.
+
+#define DrawArgs_DEFAULT _DrawARGS_DEFAULT // This is literally just for the colors.
+static const DrawArgs _DrawARGS_DEFAULT = {    
+    .bloomScale = &N::display::bloomScale,
+    .debug = &N::debug,
+    .mixBlack = true,
+    .drawBlack = false,
+
+    // All else `0` or `false`.
+};
+
+namespace DrawHandler {
     PNG png;
 
     /* Draws one line. `<PNGdec>` calls this for each line in the PNG on `png.decode()`. */
-    void PNGDraw(PNGDRAW *pDraw) {
+    void DrawCallback(PNGDRAW *pDraw) {
         PRIVATE *pPriv = (PRIVATE *)pDraw->pUser; // IDK if I can change these names? Cpp is weird. 
         uint16_t pixelsRow[64]; // image width is *always* 64.
         uint8_t  pixelsOpaque[8];
     
         /* Fetch line information. */
-        png.getLineAsRGB565(pDraw, pixelsRow, PNG_RGB565_LITTLE_ENDIAN, (pPriv->doTransparency) ? 0xFFFFFFFF : 0x00000000); // With 0xFFFFFFFF, all non-zero transparencies of a given color are that color, and `png.getAlphaMask(...)` works. With 0x00000000, every pixel gets mixed with black to include transparency as a color modifier (such as in dimmed bloom pixels). Might want to pass in a `doTransparency` arg via the `PRIVATE` struct to only selectively use this behavior. Drawing on top of without entirely erasing the scene isn't possible with 0x00000000.
+        png.getLineAsRGB565(pDraw, pixelsRow, PNG_RGB565_LITTLE_ENDIAN, (pPriv->mixBlack) ? 0x00000000 : 0xFFFFFFFF); // With 0xFFFFFFFF, all non-zero transparencies of a given color are that color, and `png.getAlphaMask(...)` works. With 0x00000000, every pixel gets mixed with black to include transparency as a color modifier (such as in dimmed bloom pixels). Might want to pass in a `doTransparency` arg via the `PRIVATE` struct to only selectively use this behavior. Drawing on top of without entirely erasing the scene isn't possible with 0x00000000.
         if (!png.getAlphaMask(pDraw, pixelsOpaque, 0)) { // Color mixing can turn transparency into black, which counts as non-opaque!
             return; // Skip row if no pixels.
         }
 
         /* Draw line. */
+        int16_t glitchJitterX    = CHANCE_GLITCHHAPPENS(pPriv->glitches.jitter) ? RAND_SIGN() * RAND_WEIGHTED(pPriv->glitches.jitter.magnitude) : 0;
+        int16_t glitchDesaturate = CHANCE_GLITCHHAPPENS(pPriv->glitches.desaturate) ? RAND_WEIGHTED(pPriv->glitches.desaturate.magnitude) : 0;
+        int16_t glitchChromatic  = CHANCE_GLITCHHAPPENS(pPriv->glitches.chromatic) ? RAND_SIGN() * RAND_WEIGHTED(pPriv->glitches.chromatic.magnitude) : 0;
+        bool    glitchFailDraw   = CHANCE_GLITCHHAPPENS(pPriv->glitches.fail);
+
+        if (glitchFailDraw) {
+            return;
+        }
+
         for (size_t x = 0; x < 64; x++) {
-            if (pPriv->doTransparency && !((pixelsOpaque[x/8] >> (7 - x%8)) & 1)) {
+            if (!pPriv->mixBlack && !((pixelsOpaque[x/8] >> (7 - x%8)) & 1)) {
                 continue; // Skip pixel if we're drawing transparency and this pixel is transparent.
             }
 
-            if (!pPriv->doBlack && !pixelsRow[x]) {
+            if (!pPriv->drawBlack && !pixelsRow[x]) {
                 continue; // Skip pixel if we're not drawing black and this pixel is black.
             }
 
@@ -96,13 +178,29 @@ namespace PNGHandler {
     
             rgb24 rgb24pixel = rgb24(red, green, blue);
             hsv24 hsv24pixel = rgbToHsv(rgb24pixel);
-            hsv24pixel.v = MIN(255, hsv24pixel.v + (255 - hsv24pixel.v)*pPriv->bloomScale);
-            hsv24pixel.s = MIN(255, hsv24pixel.s + (255 - hsv24pixel.s)*pPriv->bloomScale); 
+
+            hsv24pixel.h = (hsv24pixel.h + glitchChromatic) % 255; // Intentional rollover!
+            hsv24pixel.v = hsv24pixel.v + (255 - hsv24pixel.v)*(*pPriv->bloomScale);
+            hsv24pixel.s = hsv24pixel.s + (255 - hsv24pixel.s)*(*pPriv->bloomScale);
+            hsv24pixel.s = hsv24pixel.s - MIN(glitchDesaturate, 255 - hsv24pixel.v);
+
             rgb24pixel = hsvToRgb(hsv24pixel);
     
             /* Draw. */
-            backgroundLayer.drawPixel((int16_t)x, (int16_t)pDraw->y, rgb24pixel);   
+            int16_t modX =        x + pPriv->xOffset + glitchJitterX; 
+            int16_t modY = pDraw->y + pPriv->yOffset;
+            modX = CLAMP(modX, 0, 63);
+            modY = CLAMP(modY, 0, 63);
+
+            backgroundLayer.drawPixel((int16_t)modX, (int16_t)modY, rgb24pixel);   
         }
+    }
+    
+    /* Draw PNG from RAM. */
+    inline void drawRAM(DrawArgs args, uint8_t* png_data, int png_data_len) {
+        DrawHandler::png.close();
+        DrawHandler::png.openRAM(png_data, png_data_len, DrawHandler::DrawCallback);
+        DrawHandler::png.decode((void *)&args, 0);
     }
 };
 
@@ -138,7 +236,7 @@ namespace SDHandler {
 
 /* --- --- --- --- Animation Defs --- --- --- --- */
 
-struct AnimHandler {
+struct Animation {
     char name[32] = {0}; // Used to search file structure, so be consistent.
     char folderPath[128] = {0}; // animations/{name}/
     char basePath[12] = "animations/"; // Has the forward slash!
@@ -170,7 +268,7 @@ struct AnimHandler {
                 Serial.printf("No \"%s\". Rewinding animation \"%s\".\n", framePath, folderPath);
             }
 
-            framePath[128] = {0};
+            memset(framePath, 0, sizeof(framePath));
             strcpy(framePath, folderPath);
             strcat(framePath, name); // /animations/{anim}/{anim}
 
@@ -182,53 +280,14 @@ struct AnimHandler {
         }
         
         /* Draw from frame file path. */
-        PNGHandler::png.close();
-        PNGHandler::png.open((const char*)framePath, SDHandler::sdOpen, SDHandler::sdClose, SDHandler::sdRead, SDHandler::sdSeek, PNGHandler::PNGDraw);
-        PNGHandler::png.decode((void *)&args, 0);
+        DrawHandler::png.close();
+        DrawHandler::png.open((const char*)framePath, SDHandler::sdOpen, SDHandler::sdClose, SDHandler::sdRead, SDHandler::sdSeek, DrawHandler::DrawCallback);
+        DrawHandler::png.decode((void *)&args, 0);
     }
 };
 
-AnimHandler testSuite; // NOTE LOOKATME
-AnimHandler testSpeed; // NOTE LOOKATME
-
-/* --- --- --- --- N Defs --- --- --- --- */
-
-namespace N {
-    enum modes {
-        NCFG_M_MIN,
-        NCFG_M_KNOCKEDTFOUT,
-        NCFG_M_TESTING_SUITE,
-        NCFG_M_TESTING_SPEED,
-        NCFG_M_MAX,
-    } modes;
-
-    int mode = NCFG_M_KNOCKEDTFOUT;
-    int mode_prev;
-
-    const char* mode_to_string(int mode) {
-        switch (mode) {
-            case modes::NCFG_M_MIN: return "NCFG_M_MIN";
-            case modes::NCFG_M_KNOCKEDTFOUT: return "NCFG_M_KNOCKEDTFOUT";
-            case modes::NCFG_M_TESTING_SUITE: return "NCFG_M_TESTING_SUITE";
-            case modes::NCFG_M_TESTING_SPEED: return "NCFG_M_TESTING_SPEED";
-            default: return "!!Unknown Mode!!";
-        }
-    }
-
-    bool debug;
-    bool displayOn;
-
-    namespace display {
-        float bloomScale = 0.0; // `0.0` represents whatever the PNG actually has from asprite blurring. `1.0` maxes every transparent pixel fully opaque.
-        
-        namespace frame {
-            uint32_t millisPer = 1000/24;
-            uint32_t millisLastAt;
-            uint32_t millisSinceLast;
-            float    tooSlowAlert = (float)90/100;
-        };
-    };
-};
+Animation testSuite; // NOTE LOOKATME
+Animation testSpeed; // NOTE LOOKATME
 
 /* --- --- --- --- --- --- --- ---  */
 
@@ -327,10 +386,6 @@ void loop() {
 
     /* N Drawing w/ SmartMatrix */
     uint32_t curMillis = millis();
-    PNGDrawArgs args = {
-        .bloomScale = N::display::bloomScale,
-        .debug = N::debug,
-    };
 
     N::display::frame::millisSinceLast = curMillis - N::display::frame::millisLastAt;
     if (N::display::frame::millisSinceLast > N::display::frame::millisPer - 1) { // Draw frame if it's been a bit.
@@ -358,26 +413,28 @@ void loop() {
         /* Case per mode. */
         switch (N::mode) {
             case (N::modes::NCFG_M_KNOCKEDTFOUT): { // baked still image example
-                PNGHandler::png.close();
-                PNGHandler::png.openRAM((uint8_t *)knockedtfout_png, (int)knockedtfout_png_len, PNGHandler::PNGDraw);
-                PNGHandler::png.decode((void *)&args, 0);
+                DrawArgs args_alt = DrawArgs_DEFAULT;
+                args_alt.glitches.jitter = { .enabled = true, .chance = 0.02f, .magnitude = 3 };
+                args_alt.glitches.desaturate = { .enabled = true, .chance = 0.02f, .magnitude = 80 };
+                args_alt.glitches.fail = { .enabled = true, .chance = 0.02f };
+                args_alt.glitches.chromatic = { .enabled = true, .chance = 0.02f, .magnitude = 80 };
+                DrawHandler::drawRAM(args_alt, (uint8_t *)knockedtfout_png, (int)knockedtfout_png_len);
                 break;
             }
 
-            case (N::modes::NCFG_M_TESTING_SUITE): { // animation on sd card example
-                testSuite.drawNextFrame(args);
+            case (N::modes::NCFG_M_TEST_CARD): { // animation on sd card example
+                DrawArgs args_alt = DrawArgs_DEFAULT;
+                DrawHandler::drawRAM(args_alt, (uint8_t *)test_card_png, (int)test_card_png_len);
                 break;
             }
 
-            case (N::modes::NCFG_M_TESTING_SPEED): { // animation on sd card with transparency and layers example
-                args.doBlack = true;
-                args.doTransparency = false;
-                testSpeed.drawNextFrame(args);
+            case (N::modes::NCFG_M_TEST_ANIM): { // animation on sd card with transparency and layers example
+                DrawArgs args_alt = DrawArgs_DEFAULT;
+                args_alt.drawBlack = false;
+                args_alt.mixBlack = false;
 
-                args.doBlack = false;
-                args.doTransparency = true;
-                testSuite.drawNextFrame(args);
-
+                testSpeed.drawNextFrame(DrawArgs_DEFAULT);
+                testSuite.drawNextFrame(args_alt);
                 break;
             }
     
