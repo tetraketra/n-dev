@@ -38,7 +38,7 @@ SMARTMATRIX_ALLOCATE_INDEXED_LAYER(indexedLayer, kMatrixWidth, kMatrixHeight, CO
 #define SUPPRESS_ERROR_MESSAGE_FOR_BEGIN
 #include <IRremote.hpp>
 
-#define IR_IS_GOOD_INPUT IrReceiver.repeatCount == 0 && IrReceiver.decodedIRData.decodedRawData != 0
+#define IR_IS_GOOD_INPUT IrReceiver.repeatCount == 0 && IrReceiver.decodedIRData.decodedRawData != 0 && IrReceiver.decodedIRData.numberOfBits == 32
 
 namespace IRConfig { 
     constexpr int receivePin = 8; // Make sure to use a pin that isn't taken by the SmartMatrix LED shield!
@@ -108,6 +108,13 @@ typedef struct Glitch {
     int   magnitude;
 };
 
+typedef struct GlitchSettings { // TODO: Make the "looks nice" values defaults for glitches being on/off.
+    Glitch jitter; // Left-right jitter. `{. chance = 0.02f, .magnitude = 3 }` looks nice. 
+    Glitch chromatic; // Color alteration. `{ .chance = 0.02f, .magnitude = 80 }` loks nice.
+    Glitch desaturate; // Desaturation. `{ .chance = 0.02f, .magnitude = 80 }` looks nice.
+    Glitch fail; // Don't draw. `{ .chance = 0.02f, .magnitude = NOT_USED }` looks nice.
+};
+
 typedef struct DrawArgs { // NOTE LOOKATME: I need to figure out color mixing!
     int xOffset;
     int yOffset;
@@ -117,12 +124,7 @@ typedef struct DrawArgs { // NOTE LOOKATME: I need to figure out color mixing!
     bool   mixBlack; // If `false`, treats all non-trans pixels as *fully* opaque. If `true`, mixes with black. Combine with `doBlack` to control behavior.
     bool   drawBlack; // Whether to draw black pixels. Saves cycles sometimes when combined iwth `mixBlack=true`.
     
-    struct { // TODO: Make the "looks nice" values defaults for glitches being on/off.
-        Glitch jitter; // Left-right jitter. `{. chance = 0.02f, .magnitude = 3 }` looks nice. 
-        Glitch chromatic; // Color alteration. `{ .chance = 0.02f, .magnitude = 80 }` loks nice.
-        Glitch desaturate; // Desaturation. `{ .chance = 0.02f, .magnitude = 80 }` looks nice.
-        Glitch fail; // Don't draw. `{ .chance = 0.02f, .magnitude = NOT_USED }` looks nice.
-    } glitches;
+    GlitchSettings glitches;
 } PRIVATE; // `PRIVATE` needed for `PNGdec::PNGDraw`.
 
 #define DrawArgs_DEFAULT _DrawARGS_DEFAULT // This is literally just for the colors.
@@ -398,7 +400,7 @@ void loop() {
                 "Alert set at %.2f%%, maximally %u millis per frame. "
                 "Expected close to %u millis since last frame. Has been %u.\n", 
                 N::display::frame::tooSlowAlert*100, 
-                N::display::frame::millisPer / N::display::frame::tooSlowAlert, 
+                (int)(N::display::frame::millisPer / N::display::frame::tooSlowAlert), 
                 N::display::frame::millisPer, N::display::frame::millisSinceLast
             ); 
         }
