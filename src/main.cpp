@@ -101,6 +101,7 @@ namespace N {
 #include "include/PNGdec/PNGdec.h"
 
 #define CHANCE_GLITCHHAPPENS(glitch) ((glitch.enabled) ? CHANCE(glitch.chance) : false)
+#define DrawArgs_DEFAULT _DrawARGS_DEFAULT // This is literally just for the colors.
 
 typedef struct Glitch {
     bool  enabled; // Whether to do the glitch at all.
@@ -127,7 +128,6 @@ typedef struct DrawArgs { // NOTE LOOKATME: I need to figure out color mixing!
     GlitchSettings glitches;
 } PRIVATE; // `PRIVATE` needed for `PNGdec::PNGDraw`.
 
-#define DrawArgs_DEFAULT _DrawARGS_DEFAULT // This is literally just for the colors.
 static const DrawArgs _DrawARGS_DEFAULT = {    
     .bloomScale = &N::display::bloomScale,
     .debug = &N::debug,
@@ -141,7 +141,7 @@ namespace DrawHandler {
     PNG png;
 
     /* Draws one line. `<PNGdec>` calls this for each line in the PNG on `png.decode()`. */
-    void DrawCallback(PNGDRAW *pDraw) {
+    void drawLineCallback(PNGDRAW *pDraw) {
         PRIVATE *pPriv = (PRIVATE *)pDraw->pUser; // IDK if I can change these names? Cpp is weird. 
         uint16_t pixelsRow[64]; // image width is *always* 64.
         uint8_t  pixelsOpaque[8];
@@ -199,9 +199,9 @@ namespace DrawHandler {
     }
     
     /* Draw PNG from RAM. */
-    inline void drawRAM(DrawArgs args, uint8_t* png_data, int png_data_len) {
+    inline void drawFromRAM(DrawArgs args, uint8_t* png_data, int png_data_len) {
         DrawHandler::png.close();
-        DrawHandler::png.openRAM(png_data, png_data_len, DrawHandler::DrawCallback);
+        DrawHandler::png.openRAM(png_data, png_data_len, DrawHandler::drawLineCallback);
         DrawHandler::png.decode((void *)&args, 0);
     }
 };
@@ -214,7 +214,7 @@ namespace DrawHandler {
 namespace SDHandler {
     File sdFile;
 
-    void* sdOpen(const char* filename, int32_t* size) {
+    void* open(const char* filename, int32_t* size) {
         Serial.printf("Opening file \"%s\".\n", filename);
         
         sdFile = SD.open(filename);
@@ -223,15 +223,15 @@ namespace SDHandler {
         return &sdFile;
     }
 
-    void sdClose(void* handle) {
+    void close(void* handle) {
         if (sdFile) { sdFile.close(); }
     }
 
-    int32_t sdRead(PNGFILE* handle, uint8_t* buffer, int32_t length) {
+    int32_t read(PNGFILE* handle, uint8_t* buffer, int32_t length) {
         return (sdFile) ? sdFile.read(buffer, length) : 0;
     }
 
-    int32_t sdSeek(PNGFILE* handle, int32_t position) {
+    int32_t seek(PNGFILE* handle, int32_t position) {
         return (sdFile) ? sdFile.seek(position) : 0;
     }
 };
@@ -283,13 +283,76 @@ struct Animation {
         
         /* Draw from frame file path. */
         DrawHandler::png.close();
-        DrawHandler::png.open((const char*)framePath, SDHandler::sdOpen, SDHandler::sdClose, SDHandler::sdRead, SDHandler::sdSeek, DrawHandler::DrawCallback);
+        DrawHandler::png.open((const char*)framePath, SDHandler::open, SDHandler::close, SDHandler::read, SDHandler::seek, DrawHandler::drawLineCallback);
         DrawHandler::png.decode((void *)&args, 0);
     }
 };
 
 Animation testSuite; // NOTE LOOKATME
 Animation testSpeed; // NOTE LOOKATME
+
+/* --- --- --- --- LCD Defs --- --- --- --- */
+
+#include <LCD_I2C.h>
+
+LCD_I2C lcd(0x27, 16, 2);
+
+/* --- --- --- --- MPU Defs --- --- --- --- */
+
+#include <I2Cdev.h>
+#include <MPU6050.h>
+
+namespace MPUHandler {
+    MPU6050 mpu(0x68, &Wire1);
+
+    int16_t ax, ay, az; // (A)ccel (X|Y|Z)-axis
+    int16_t gx, gy, gz; // (G)yro  (X|Y|Z)-axis
+    int16_t axd, ayd, azd; // Deltas.
+    int16_t gxd, gyd, gzd; // Deltas.
+
+    bool filterSmall = true;
+    int  filterThrsh = 600;
+
+    void update() {
+        int16_t tax, tay, taz; tax = ax; tay = ay; taz = az; // Temporary variables.
+        int16_t tgx, tgy, tgz; tgx = gx; tgy = gy; tgz = gz; // Temporary variables.
+        
+        mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+        axd = ax-tax; ayd = ay-tay; azd = az-taz;
+        gxd = gx-tgx; gyd = gy-tgy; gzd = gz-tgz;
+
+        if (filterSmall) {
+            axd = (axd < filterThrsh) ? 0 : axd;
+            ayd = (ayd < filterThrsh) ? 0 : ayd;
+            azd = (azd < filterThrsh) ? 0 : azd;
+
+            gxd = (gxd < filterThrsh) ? 0 : gxd;
+            gyd = (gyd < filterThrsh) ? 0 : gyd;
+            gzd = (gzd < filterThrsh) ? 0 : gzd;
+        }
+    }
+
+    /** Print raw accel and gyro data. */
+    void printAG() {
+        Serial.printf(
+            "Accl: x=%05d, \ty=%05d, \tz=%05d, "
+            "Gyro: x=%05d, \ty=%05d, \tz=%05d.\n", 
+                       ax,       ay,       az,
+                       gx,       gy,       gz
+        );
+    }
+
+    /* Print accel and gyro deltas. */
+    void printAGD() {
+        Serial.printf(
+            "AcclD: x=%05d, \ty=%05d, \tz=%05d, "
+            "GyroD: x=%05d, \ty=%05d, \tz=%05d.\n", 
+                       axd,      ayd,      azd,
+                       gxd,      gyd,      gzd
+        );
+    }
+};
 
 /* --- --- --- --- --- --- --- ---  */
 
@@ -318,6 +381,15 @@ void setup() {
     SD.begin(BUILTIN_SDCARD);
     // SD.sdfs.ls(LS_R); // Optional to see the file structure during testing.
 
+    /* LCD Setup */
+    Wire.begin();
+    lcd.begin();
+    lcd.backlight();
+
+    /* MPU Setup */
+    Wire1.begin();
+    MPUHandler::mpu.initialize();
+
     /* N Defaults */
     N::debug = false; // Overwride default debug state if needed (e.g. on new controller to get cmd#s).
     N::mode = N::modes::NCFG_M_KNOCKEDTFOUT;
@@ -328,6 +400,10 @@ void setup() {
 }
 
 void loop() {
+
+    if (!MPUHandler::mpu.testConnection()) {
+        Serial.printf("FAILED!");
+    }
 
     /* IR Remote Command Receiving */
     if (IrReceiver.decode()) {
@@ -393,6 +469,13 @@ void loop() {
     if (N::display::frame::millisSinceLast > N::display::frame::millisPer - 1) { // Draw frame if it's been a bit.
         N::display::frame::millisLastAt = curMillis;
 
+        /* TESTING NEW COMPONENTS FIXME */
+        // lcd.clear();
+        // lcd.setCursor(0, 0);
+        // lcd.print("Hello!");
+        // MPUHandler::update();
+        // MPUHandler::printAGD();
+
         /* Debug print if been too long since last frame. */
         if (N::debug && N::display::frame::millisSinceLast > N::display::frame::millisPer / N::display::frame::tooSlowAlert) { 
             Serial.printf(
@@ -420,13 +503,13 @@ void loop() {
                 args_alt.glitches.desaturate = { .enabled = true, .chance = 0.02f, .magnitude = 80 };
                 args_alt.glitches.fail = { .enabled = true, .chance = 0.02f };
                 args_alt.glitches.chromatic = { .enabled = true, .chance = 0.02f, .magnitude = 80 };
-                DrawHandler::drawRAM(args_alt, (uint8_t *)knockedtfout_png, (int)knockedtfout_png_len);
+                DrawHandler::drawFromRAM(args_alt, (uint8_t *)knockedtfout_png, (int)knockedtfout_png_len);
                 break;
             }
 
             case (N::modes::NCFG_M_TEST_CARD): { // animation on sd card example
                 DrawArgs args_alt = DrawArgs_DEFAULT;
-                DrawHandler::drawRAM(args_alt, (uint8_t *)test_card_png, (int)test_card_png_len);
+                DrawHandler::drawFromRAM(args_alt, (uint8_t *)test_card_png, (int)test_card_png_len);
                 break;
             }
 
