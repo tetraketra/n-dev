@@ -35,26 +35,36 @@ SMARTMATRIX_ALLOCATE_INDEXED_LAYER(indexedLayer, kMatrixWidth, kMatrixHeight, CO
 
 /* --- --- --- --- IR Remote Defs --- --- --- --- */
 
+#define DECODE_STRICT_CHECKS
+#define EXCLUDE_EXOTIC_PROTOCOLS
 #define SUPPRESS_ERROR_MESSAGE_FOR_BEGIN
 #include <IRremote.hpp>
 
-#define IR_IS_GOOD_INPUT IrReceiver.repeatCount == 0 && IrReceiver.decodedIRData.decodedRawData != 0 && IrReceiver.decodedIRData.numberOfBits == 32
+/* --- --- --- --- Draw Defs --- --- --- --- */
 
-namespace IRConfig { 
-    constexpr int receivePin = 8; // Make sure to use a pin that isn't taken by the SmartMatrix LED shield!
+#include "hardcoded_images/knockedtfout.h"
+#include "hardcoded_images/test_card.h"
 
-    namespace commands { // Change these based on the commands given by your specific IR remote.
-        constexpr uint16_t debugToggle = 0x44;
-        constexpr uint16_t powerToggle = 0x8;
-        constexpr uint16_t bloomUp     = 0x2;
-        constexpr uint16_t bloomDown   = 0x3;
-        constexpr uint16_t next        = 0x0;
-        constexpr uint16_t prev        = 0x1;
-    };
-};
+#include "include/hsv.hpp"
+#include "include/PNGdec/PNGdec.h"
 
-/* --- --- --- --- N Defs --- --- --- --- */
+#define DrawArgs_DEFAULT N::DRAW::_DrawARGS_DEFAULT // This is literally just for the colors.
 
+/* --- --- --- --- SD Card Defs --- --- --- ---  */
+
+#include <SD.h>
+#include <cstring>
+
+/* --- --- --- --- LCD Defs --- --- --- --- */
+
+#include <LCD_I2C.h>
+
+/* --- --- --- --- MPU Defs --- --- --- --- */
+
+#include <I2Cdev.h>
+#include <MPU6050.h>
+
+/* --- --- --- --- Monolith Defs --- --- --- --- */
 namespace N {
     enum modes {
         NCFG_M_MIN,
@@ -80,278 +90,289 @@ namespace N {
     bool debug;
     bool displayOn;
 
-    namespace display {
+    namespace IR   { // IR Communcation. 
+        constexpr int receivePin = 8; // Make sure to use a pin that isn't taken by the SmartMatrix LED shield!
+    
+        namespace commands { // Change these based on the commands given by your specific IR remote.
+            constexpr uint32_t debugToggle = 0x44;
+            constexpr uint32_t powerToggle = 0x8;
+            constexpr uint32_t bloomUp     = 0x2;
+            constexpr uint32_t bloomDown   = 0x3;
+            constexpr uint32_t next        = 0x0;
+            constexpr uint32_t prev        = 0x1;
+
+            const char* toString(uint32_t command) {
+                switch (command) {
+                    case debugToggle: return "debugToggle";
+                    case powerToggle: return "powerToggle";
+                    case bloomUp:     return "bloomUp";
+                    case bloomDown:   return "bloomDOwn";
+                    case next:        return "next";
+                    case prev:        return "prev"; 
+                    default:          return "!!!UNRECOGNIZED!!!";
+                }
+            } 
+        };
+    
+        inline bool inputIsGood() {
+            return (
+                IrReceiver.repeatCount == 0 &&
+                IrReceiver.decodedIRData.decodedRawData != 0 &&
+                IrReceiver.decodedIRData.numberOfBits == 32 &&
+                IrReceiver.decodedIRData.protocol != UNKNOWN
+            );
+        }
+
+        inline uint32_t decodedCommand() {
+            return IrReceiver.decodedIRData.command;
+        }
+
+        inline const char* decodedCommandString() {
+            return commands::toString(decodedCommand());
+        }
+    };
+    namespace DRAW { // Drawing. 
+        PNG png;
+        
         float bloomScale = 0.0; // `0.0` represents whatever the PNG actually has from asprite blurring. `1.0` maxes every transparent pixel fully opaque.
         
-        namespace frame {
-            uint32_t millisPer = 1000/24;
-            uint32_t millisLastAt;
-            uint32_t millisSinceLast;
-            float    tooSlowAlert = (float)90/100;
+        uint32_t frameMillisPer = 1000/24;
+        uint32_t frameMillisLastAt;
+        uint32_t frameMillisSinceLast;
+        float    frameTooSlowAlert = (float)90/100;
+
+        struct Glitch {
+            bool  enabled; // Whether to do the glitch at all.
+            float chance;
+            int   magnitude;
+
+            inline bool happens() {
+                return ((enabled) ? CHANCE(chance) : false);
+            }
+        };        
+
+        typedef struct DrawArgs { // TODO: Figure out color mixing.
+            int xOffset;
+            int yOffset;
+
+            float* bloomScale;
+            bool*  debug;
+            bool   mixBlack; // If `false`, treats all non-trans pixels as *fully* opaque. If `true`, mixes with black. Combine with `doBlack` to control behavior.
+            bool   drawBlack; // Whether to draw black pixels. Saves cycles sometimes when combined iwth `mixBlack=true`.
+            
+            struct Glitches { // TODO: Make the "looks nice" values defaults for glitches being on/off.
+                Glitch jitter; // Left-right jitter. `{. chance = 0.02f, .magnitude = 3 }` looks nice. 
+                Glitch chromatic; // Color alteration. `{ .chance = 0.02f, .magnitude = 80 }` loks nice.
+                Glitch desaturate; // Desaturation. `{ .chance = 0.02f, .magnitude = 80 }` looks nice.
+                Glitch fail; // Don't draw. `{ .chance = 0.02f, .magnitude = NOT_USED }` looks nice.
+            } glitches;
+        } PRIVATE; // `PRIVATE` needed for `PNGdec::PNGDraw`.
+
+        static const DrawArgs _DrawARGS_DEFAULT = {    
+            .bloomScale = &N::DRAW::bloomScale,
+            .debug = &N::debug,
+            .mixBlack = true,
+            .drawBlack = false,
         };
+    
+        /* Draws one line. `<PNGdec>` calls this for each line in the PNG on `png.decode()`. */
+        void drawLineCallback(PNGDRAW *pDraw) {
+            PRIVATE *pPriv = (PRIVATE *)pDraw->pUser; // IDK if I can change these names? Cpp is weird. 
+            uint16_t pixelsRow[64]; // image width is *always* 64.
+            uint8_t  pixelsOpaque[8];
+        
+            /* Fetch line information. */
+            png.getLineAsRGB565(pDraw, pixelsRow, PNG_RGB565_LITTLE_ENDIAN, (pPriv->mixBlack) ? 0x00000000 : 0xFFFFFFFF); // With 0xFFFFFFFF, all non-zero transparencies of a given color are that color, and `png.getAlphaMask(...)` works. With 0x00000000, every pixel gets mixed with black to include transparency as a color modifier (such as in dimmed bloom pixels). Might want to pass in a `doTransparency` arg via the `PRIVATE` struct to only selectively use this behavior. Drawing on top of without entirely erasing the scene isn't possible with 0x00000000.
+            if (!png.getAlphaMask(pDraw, pixelsOpaque, 0)) { // Color mixing can turn transparency into black, which counts as non-opaque!
+                return; // Skip row if no pixels.
+            }
+    
+            /* Draw line. */
+            int16_t glitchJitterX    = pPriv->glitches.jitter.happens() ? RAND_SIGN() * RAND_WEIGHTED(pPriv->glitches.jitter.magnitude) : 0;
+            int16_t glitchDesaturate = pPriv->glitches.desaturate.happens() ? RAND_WEIGHTED(pPriv->glitches.desaturate.magnitude) : 0;
+            int16_t glitchChromatic  = pPriv->glitches.chromatic.happens() ? RAND_SIGN() * RAND_WEIGHTED(pPriv->glitches.chromatic.magnitude) : 0;
+            bool    glitchFailDraw   = pPriv->glitches.fail.happens();
+    
+            if (glitchFailDraw) {
+                return;
+            }
+    
+            for (size_t x = 0; x < 64; x++) {
+                if (!pPriv->mixBlack && !((pixelsOpaque[x/8] >> (7 - x%8)) & 1)) {
+                    continue; // Skip pixel if we're drawing transparency and this pixel is transparent.
+                }
+    
+                if (!pPriv->drawBlack && !pixelsRow[x]) {
+                    continue; // Skip pixel if we're not drawing black and this pixel is black.
+                }
+    
+                /* Recompose as rgb24. */
+                uint16_t rgb565pixel = pixelsRow[x];
+    
+                uint8_t blue =  ( rgb565pixel        & 0x1F) << 3;
+                uint8_t green = ((rgb565pixel >> 5)  & 0x3F) << 2;
+                uint8_t red =   ((rgb565pixel >> 11) & 0x1F) << 3;
+        
+                rgb24 rgb24pixel = rgb24(red, green, blue);
+                hsv24 hsv24pixel = rgbToHsv(rgb24pixel);
+    
+                hsv24pixel.h = (hsv24pixel.h + glitchChromatic) % 255; // Intentional rollover!
+                hsv24pixel.v = hsv24pixel.v + (255 - hsv24pixel.v)*(*pPriv->bloomScale);
+                hsv24pixel.s = hsv24pixel.s + (255 - hsv24pixel.s)*(*pPriv->bloomScale);
+                hsv24pixel.s = hsv24pixel.s - MIN(glitchDesaturate, 255 - hsv24pixel.v);
+    
+                rgb24pixel = hsvToRgb(hsv24pixel);
+        
+                /* Draw. */
+                int16_t modX =        x + pPriv->xOffset + glitchJitterX; 
+                int16_t modY = pDraw->y + pPriv->yOffset;
+                modX = CLAMP(modX, 0, 63);
+                modY = CLAMP(modY, 0, 63);
+    
+                backgroundLayer.drawPixel((int16_t)modX, (int16_t)modY, rgb24pixel);   
+            }
+        }
+        
+        /* Draw PNG from RAM. */
+        inline void drawFromRAM(DrawArgs args, uint8_t* png_data, int png_data_len) {
+            png.close();
+            png.openRAM(png_data, png_data_len, drawLineCallback);
+            png.decode((void *)&args, 0);
+        }
     };
-};
-
-/* --- --- --- --- PNG Printer Defs --- --- --- --- */
-
-#include "hardcoded_images/knockedtfout.h"
-#include "hardcoded_images/test_card.h"
-
-#include "include/hsv.hpp"
-#include "include/PNGdec/PNGdec.h"
-
-#define CHANCE_GLITCHHAPPENS(glitch) ((glitch.enabled) ? CHANCE(glitch.chance) : false)
-#define DrawArgs_DEFAULT _DrawARGS_DEFAULT // This is literally just for the colors.
-
-typedef struct Glitch {
-    bool  enabled; // Whether to do the glitch at all.
-    float chance;
-    int   magnitude;
-};
-
-typedef struct GlitchSettings { // TODO: Make the "looks nice" values defaults for glitches being on/off.
-    Glitch jitter; // Left-right jitter. `{. chance = 0.02f, .magnitude = 3 }` looks nice. 
-    Glitch chromatic; // Color alteration. `{ .chance = 0.02f, .magnitude = 80 }` loks nice.
-    Glitch desaturate; // Desaturation. `{ .chance = 0.02f, .magnitude = 80 }` looks nice.
-    Glitch fail; // Don't draw. `{ .chance = 0.02f, .magnitude = NOT_USED }` looks nice.
-};
-
-typedef struct DrawArgs { // NOTE LOOKATME: I need to figure out color mixing!
-    int xOffset;
-    int yOffset;
-
-    float* bloomScale;
-    bool*  debug;
-    bool   mixBlack; // If `false`, treats all non-trans pixels as *fully* opaque. If `true`, mixes with black. Combine with `doBlack` to control behavior.
-    bool   drawBlack; // Whether to draw black pixels. Saves cycles sometimes when combined iwth `mixBlack=true`.
+    namespace SDC  { // SD Card. 
+        File sdFile;
     
-    GlitchSettings glitches;
-} PRIVATE; // `PRIVATE` needed for `PNGdec::PNGDraw`.
-
-static const DrawArgs _DrawARGS_DEFAULT = {    
-    .bloomScale = &N::display::bloomScale,
-    .debug = &N::debug,
-    .mixBlack = true,
-    .drawBlack = false,
-
-    // All else `0` or `false`.
-};
-
-namespace DrawHandler {
-    PNG png;
-
-    /* Draws one line. `<PNGdec>` calls this for each line in the PNG on `png.decode()`. */
-    void drawLineCallback(PNGDRAW *pDraw) {
-        PRIVATE *pPriv = (PRIVATE *)pDraw->pUser; // IDK if I can change these names? Cpp is weird. 
-        uint16_t pixelsRow[64]; // image width is *always* 64.
-        uint8_t  pixelsOpaque[8];
-    
-        /* Fetch line information. */
-        png.getLineAsRGB565(pDraw, pixelsRow, PNG_RGB565_LITTLE_ENDIAN, (pPriv->mixBlack) ? 0x00000000 : 0xFFFFFFFF); // With 0xFFFFFFFF, all non-zero transparencies of a given color are that color, and `png.getAlphaMask(...)` works. With 0x00000000, every pixel gets mixed with black to include transparency as a color modifier (such as in dimmed bloom pixels). Might want to pass in a `doTransparency` arg via the `PRIVATE` struct to only selectively use this behavior. Drawing on top of without entirely erasing the scene isn't possible with 0x00000000.
-        if (!png.getAlphaMask(pDraw, pixelsOpaque, 0)) { // Color mixing can turn transparency into black, which counts as non-opaque!
-            return; // Skip row if no pixels.
-        }
-
-        /* Draw line. */
-        int16_t glitchJitterX    = CHANCE_GLITCHHAPPENS(pPriv->glitches.jitter) ? RAND_SIGN() * RAND_WEIGHTED(pPriv->glitches.jitter.magnitude) : 0;
-        int16_t glitchDesaturate = CHANCE_GLITCHHAPPENS(pPriv->glitches.desaturate) ? RAND_WEIGHTED(pPriv->glitches.desaturate.magnitude) : 0;
-        int16_t glitchChromatic  = CHANCE_GLITCHHAPPENS(pPriv->glitches.chromatic) ? RAND_SIGN() * RAND_WEIGHTED(pPriv->glitches.chromatic.magnitude) : 0;
-        bool    glitchFailDraw   = CHANCE_GLITCHHAPPENS(pPriv->glitches.fail);
-
-        if (glitchFailDraw) {
-            return;
-        }
-
-        for (size_t x = 0; x < 64; x++) {
-            if (!pPriv->mixBlack && !((pixelsOpaque[x/8] >> (7 - x%8)) & 1)) {
-                continue; // Skip pixel if we're drawing transparency and this pixel is transparent.
-            }
-
-            if (!pPriv->drawBlack && !pixelsRow[x]) {
-                continue; // Skip pixel if we're not drawing black and this pixel is black.
-            }
-
-            /* Recompose as rgb24. */
-            uint16_t rgb565pixel = pixelsRow[x];
-
-            uint8_t blue =  ( rgb565pixel        & 0x1F) << 3;
-            uint8_t green = ((rgb565pixel >> 5)  & 0x3F) << 2;
-            uint8_t red =   ((rgb565pixel >> 11) & 0x1F) << 3;
-    
-            rgb24 rgb24pixel = rgb24(red, green, blue);
-            hsv24 hsv24pixel = rgbToHsv(rgb24pixel);
-
-            hsv24pixel.h = (hsv24pixel.h + glitchChromatic) % 255; // Intentional rollover!
-            hsv24pixel.v = hsv24pixel.v + (255 - hsv24pixel.v)*(*pPriv->bloomScale);
-            hsv24pixel.s = hsv24pixel.s + (255 - hsv24pixel.s)*(*pPriv->bloomScale);
-            hsv24pixel.s = hsv24pixel.s - MIN(glitchDesaturate, 255 - hsv24pixel.v);
-
-            rgb24pixel = hsvToRgb(hsv24pixel);
-    
-            /* Draw. */
-            int16_t modX =        x + pPriv->xOffset + glitchJitterX; 
-            int16_t modY = pDraw->y + pPriv->yOffset;
-            modX = CLAMP(modX, 0, 63);
-            modY = CLAMP(modY, 0, 63);
-
-            backgroundLayer.drawPixel((int16_t)modX, (int16_t)modY, rgb24pixel);   
-        }
-    }
-    
-    /* Draw PNG from RAM. */
-    inline void drawFromRAM(DrawArgs args, uint8_t* png_data, int png_data_len) {
-        DrawHandler::png.close();
-        DrawHandler::png.openRAM(png_data, png_data_len, DrawHandler::drawLineCallback);
-        DrawHandler::png.decode((void *)&args, 0);
-    }
-};
-
-/* --- --- --- --- SD Card Defs --- --- --- ---  */
-
-#include <SD.h>
-#include <cstring>
-
-namespace SDHandler {
-    File sdFile;
-
-    void* open(const char* filename, int32_t* size) {
-        Serial.printf("Opening file \"%s\".\n", filename);
+        void* open(const char* filename, int32_t* size) {
+            Serial.printf("Opening file \"%s\".\n", filename);
+            
+            sdFile = SD.open(filename);
+            *size = sdFile.size();
         
-        sdFile = SD.open(filename);
-        *size = sdFile.size();
+            return &sdFile;
+        }
     
-        return &sdFile;
-    }
-
-    void close(void* handle) {
-        if (sdFile) { sdFile.close(); }
-    }
-
-    int32_t read(PNGFILE* handle, uint8_t* buffer, int32_t length) {
-        return (sdFile) ? sdFile.read(buffer, length) : 0;
-    }
-
-    int32_t seek(PNGFILE* handle, int32_t position) {
-        return (sdFile) ? sdFile.seek(position) : 0;
-    }
-};
-
-/* --- --- --- --- Animation Defs --- --- --- --- */
-
-struct Animation {
-    char name[32] = {0}; // Used to search file structure, so be consistent.
-    char folderPath[128] = {0}; // animations/{name}/
-    char basePath[12] = "animations/"; // Has the forward slash!
-    int  curFrame = 0;
-
-    void init(const char* animName) {
-        strcpy(name, animName);
-
-        strcpy(folderPath, basePath);
-        strcat(folderPath, animName);
-        strcat(folderPath, "/"); // animations/{name}/
-    }
-
-    void drawNextFrame(PRIVATE args) {
-        /* Create path of next-to-be-drawn frame file. */
-        char framePath[128] = {0};
-        strcpy(framePath, folderPath);
-        strcat(framePath, name); // animations/{anim}/{anim}
-
-        curFrame++;
-        char frameNum[16] = {0};
-        itoa(curFrame, frameNum, 10);
-        strcat(framePath, frameNum);
-        strcat(framePath, ".png"); // animations/{anim}/{anim}{frameNum}.png
-
-        /* Revert back to frame #1 if at the end of the animation. */
-        if (!SD.exists(framePath)) {
-            if (args.debug) {
-                Serial.printf("No \"%s\". Rewinding animation \"%s\".\n", framePath, folderPath);
+        void close(void* handle) {
+            if (sdFile) { sdFile.close(); }
+        }
+    
+        int32_t read(PNGFILE* handle, uint8_t* buffer, int32_t length) {
+            return (sdFile) ? sdFile.read(buffer, length) : 0;
+        }
+    
+        int32_t seek(PNGFILE* handle, int32_t position) {
+            return (sdFile) ? sdFile.seek(position) : 0;
+        }
+    };
+    namespace LCD  { // LCD Screen. 
+        LCD_I2C lcd(0x27, 16, 2);
+    };
+    namespace MPU  { // Accelerometer. 
+        MPU6050 mpu(0x68, &Wire1);
+    
+        int16_t ax, ay, az; // (A)ccel (X|Y|Z)-axis
+        int16_t gx, gy, gz; // (G)yro  (X|Y|Z)-axis
+        int16_t axd, ayd, azd; // Deltas.
+        int16_t gxd, gyd, gzd; // Deltas.
+    
+        bool filterSmall = true;
+        int  filterThrsh = 600;
+    
+        void update() {
+            int16_t tax, tay, taz; tax = ax; tay = ay; taz = az; // Temporary variables.
+            int16_t tgx, tgy, tgz; tgx = gx; tgy = gy; tgz = gz; // Temporary variables.
+            
+            mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    
+            axd = ax-tax; ayd = ay-tay; azd = az-taz;
+            gxd = gx-tgx; gyd = gy-tgy; gzd = gz-tgz;
+    
+            if (filterSmall) {
+                axd = (axd < filterThrsh) ? 0 : axd;
+                ayd = (ayd < filterThrsh) ? 0 : ayd;
+                azd = (azd < filterThrsh) ? 0 : azd;
+    
+                gxd = (gxd < filterThrsh) ? 0 : gxd;
+                gyd = (gyd < filterThrsh) ? 0 : gyd;
+                gzd = (gzd < filterThrsh) ? 0 : gzd;
             }
-
-            memset(framePath, 0, sizeof(framePath));
-            strcpy(framePath, folderPath);
-            strcat(framePath, name); // /animations/{anim}/{anim}
-
-            curFrame = 1;
-            char frameNum[16] = {0};
-            itoa(curFrame, frameNum, 10);
-            strcat(framePath, frameNum);
-            strcat(framePath, ".png"); // /animations/{anim}/{anim}1.png
         }
-        
-        /* Draw from frame file path. */
-        DrawHandler::png.close();
-        DrawHandler::png.open((const char*)framePath, SDHandler::open, SDHandler::close, SDHandler::read, SDHandler::seek, DrawHandler::drawLineCallback);
-        DrawHandler::png.decode((void *)&args, 0);
-    }
-};
-
-Animation testSuite; // NOTE LOOKATME
-Animation testSpeed; // NOTE LOOKATME
-
-/* --- --- --- --- LCD Defs --- --- --- --- */
-
-#include <LCD_I2C.h>
-
-LCD_I2C lcd(0x27, 16, 2);
-
-/* --- --- --- --- MPU Defs --- --- --- --- */
-
-#include <I2Cdev.h>
-#include <MPU6050.h>
-
-namespace MPUHandler {
-    MPU6050 mpu(0x68, &Wire1);
-
-    int16_t ax, ay, az; // (A)ccel (X|Y|Z)-axis
-    int16_t gx, gy, gz; // (G)yro  (X|Y|Z)-axis
-    int16_t axd, ayd, azd; // Deltas.
-    int16_t gxd, gyd, gzd; // Deltas.
-
-    bool filterSmall = true;
-    int  filterThrsh = 600;
-
-    void update() {
-        int16_t tax, tay, taz; tax = ax; tay = ay; taz = az; // Temporary variables.
-        int16_t tgx, tgy, tgz; tgx = gx; tgy = gy; tgz = gz; // Temporary variables.
-        
-        mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-
-        axd = ax-tax; ayd = ay-tay; azd = az-taz;
-        gxd = gx-tgx; gyd = gy-tgy; gzd = gz-tgz;
-
-        if (filterSmall) {
-            axd = (axd < filterThrsh) ? 0 : axd;
-            ayd = (ayd < filterThrsh) ? 0 : ayd;
-            azd = (azd < filterThrsh) ? 0 : azd;
-
-            gxd = (gxd < filterThrsh) ? 0 : gxd;
-            gyd = (gyd < filterThrsh) ? 0 : gyd;
-            gzd = (gzd < filterThrsh) ? 0 : gzd;
+    
+        /** Print raw accel and gyro data. */
+        void printAG() {
+            Serial.printf(
+                "Accl: x=%05d, \ty=%05d, \tz=%05d, "
+                "Gyro: x=%05d, \ty=%05d, \tz=%05d.\n", 
+                           ax,       ay,       az,
+                           gx,       gy,       gz
+            );
         }
-    }
-
-    /** Print raw accel and gyro data. */
-    void printAG() {
-        Serial.printf(
-            "Accl: x=%05d, \ty=%05d, \tz=%05d, "
-            "Gyro: x=%05d, \ty=%05d, \tz=%05d.\n", 
-                       ax,       ay,       az,
-                       gx,       gy,       gz
-        );
-    }
-
-    /* Print accel and gyro deltas. */
-    void printAGD() {
-        Serial.printf(
-            "AcclD: x=%05d, \ty=%05d, \tz=%05d, "
-            "GyroD: x=%05d, \ty=%05d, \tz=%05d.\n", 
-                       axd,      ayd,      azd,
-                       gxd,      gyd,      gzd
-        );
-    }
+    
+        /* Print accel and gyro deltas. */
+        void printAGD() {
+            Serial.printf(
+                "AcclD: x=%05d, \ty=%05d, \tz=%05d, "
+                "GyroD: x=%05d, \ty=%05d, \tz=%05d.\n", 
+                           axd,      ayd,      azd,
+                           gxd,      gyd,      gzd
+            );
+        }
+    };
+    namespace ANIM { // Animations. 
+        typedef struct Animation {
+            char name[32] = {0}; // Used to search file structure, so be consistent.
+            char folderPath[128] = {0}; // animations/{name}/
+            char basePath[12] = "animations/"; // Has the forward slash!
+            int  curFrame = 0;
+        
+            void init(const char* animName) {
+                strcpy(name, animName);
+        
+                strcpy(folderPath, basePath);
+                strcat(folderPath, animName);
+                strcat(folderPath, "/"); // animations/{name}/
+            }
+        
+            void drawNextFrame(N::DRAW::PRIVATE args) {
+                /* Create path of next-to-be-drawn frame file. */
+                char framePath[128] = {0};
+                strcpy(framePath, folderPath);
+                strcat(framePath, name); // animations/{anim}/{anim}
+        
+                curFrame++;
+                char frameNum[16] = {0};
+                itoa(curFrame, frameNum, 10);
+                strcat(framePath, frameNum);
+                strcat(framePath, ".png"); // animations/{anim}/{anim}{frameNum}.png
+        
+                /* Revert back to frame #1 if at the end of the animation. */
+                if (!SD.exists(framePath)) {
+                    if (args.debug) {
+                        Serial.printf("No \"%s\". Rewinding animation \"%s\".\n", framePath, folderPath);
+                    }
+        
+                    memset(framePath, 0, sizeof(framePath));
+                    strcpy(framePath, folderPath);
+                    strcat(framePath, name); // /animations/{anim}/{anim}
+        
+                    curFrame = 1;
+                    char frameNum[16] = {0};
+                    itoa(curFrame, frameNum, 10);
+                    strcat(framePath, frameNum);
+                    strcat(framePath, ".png"); // /animations/{anim}/{anim}1.png
+                }
+                
+                /* Draw from frame file path. */
+                N::DRAW::png.close();
+                N::DRAW::png.open((const char*)framePath, N::SDC::open, N::SDC::close, N::SDC::read, N::SDC::seek, N::DRAW::drawLineCallback);
+                N::DRAW::png.decode((void *)&args, 0);
+            }
+        };
+        
+        Animation testSuite; // NOTE LOOKATME
+        Animation testSpeed; // NOTE LOOKATME
+    
+    };
 };
 
 /* --- --- --- --- --- --- --- ---  */
@@ -373,9 +394,9 @@ void setup() {
     while (!Serial && millis() < 3000) { yield(); }
 
     /* IR Remote Setup */
-    pinMode(IRConfig::receivePin, INPUT);
+    pinMode(N::IR::receivePin, INPUT);
 
-    IrReceiver.begin(IRConfig::receivePin, DISABLE_LED_FEEDBACK);
+    IrReceiver.begin(N::IR::receivePin, DISABLE_LED_FEEDBACK);
 
     /* SD Card Setup */
     SD.begin(BUILTIN_SDCARD);
@@ -383,110 +404,98 @@ void setup() {
 
     /* LCD Setup */
     Wire.begin();
-    lcd.begin();
-    lcd.backlight();
+    N::LCD::lcd.begin();
+    N::LCD::lcd.backlight();
 
     /* MPU Setup */
     Wire1.begin();
-    MPUHandler::mpu.initialize();
+    N::MPU::mpu.initialize();
 
     /* N Defaults */
     N::debug = false; // Overwride default debug state if needed (e.g. on new controller to get cmd#s).
     N::mode = N::modes::NCFG_M_KNOCKEDTFOUT;
 
     /* Animation Setup */
-    testSuite.init("test_suite");
-    testSpeed.init("test_speed");
+    N::ANIM::testSuite.init("test_suite");
+    N::ANIM::testSpeed.init("test_speed");
 }
 
 void loop() {
 
-    if (!MPUHandler::mpu.testConnection()) {
-        Serial.printf("FAILED!");
-    }
-
     /* IR Remote Command Receiving */
     if (IrReceiver.decode()) {
-        if (IR_IS_GOOD_INPUT) {
+        if (N::IR::inputIsGood()) { // This has to be indented or stuff breaks.
 
             /* Print debug if enabled. */
             if (N::debug) {
-                Serial.printf("IR received: ");
+                Serial.printf("IR received \"%s\": ", N::IR::decodedCommandString());
                 IrReceiver.printIRResultShort(&Serial);
             }
-            
-            /* Toggle debug if `commandDebugToggle` pressed. */
-            if (IrReceiver.decodedIRData.command == IRConfig::commands::debugToggle) {
-                Serial.printf("Debug %s.\n", (N::debug) ? "disabled" : "enabled");
-                N::debug ^= true;
-            }
 
-            /* [In|de]crease bloom. */
+            /* Act on command. */
             float bloomChanged = 0.0;
-            if (IrReceiver.decodedIRData.command == IRConfig::commands::bloomUp) {
-                if (N::display::bloomScale < 0.39) { 
-                    N::display::bloomScale += (bloomChanged =  0.05); 
-                }
-            } else if (IrReceiver.decodedIRData.command == IRConfig::commands::bloomDown) {
-                if (N::display::bloomScale > 0.01) { 
-                    N::display::bloomScale += (bloomChanged = -0.05); 
-                }
+            switch (N::IR::decodedCommand()) {
+                case N::IR::commands::debugToggle: 
+                    Serial.printf("Debug %s.\n", (N::debug) ? "disabled" : "enabled");
+                    N::debug ^= true;
+                    break;
+                case N::IR::commands::powerToggle:
+                    N::displayOn = !N::displayOn;
+                    if (N::debug) { Serial.printf("N display turned %s.\n", (N::displayOn) ? "on" : "off"); }
+                    break;
+                /* NOTE all *cases* below this line to be refactored NOTE */
+                case N::IR::commands::bloomUp: 
+                    if (N::DRAW::bloomScale < 0.39) { N::DRAW::bloomScale += (bloomChanged =  0.05); }
+                    break;
+                case N::IR::commands::bloomDown: 
+                    if (N::DRAW::bloomScale > 0.01) { N::DRAW::bloomScale += (bloomChanged = -0.05); }
+                    break;
+                case N::IR::commands::next:
+                    if (N::mode < N::modes::NCFG_M_MAX - 1) { N::mode += 1; }
+                    break;
+                case N::IR::commands::prev:
+                    if (N::mode > N::modes:: NCFG_M_MIN + 1) { N::mode -= 1; }
+                    break;
             }
 
-            if (N::debug && bloomChanged) {
+            if (N::debug && bloomChanged) { // NOTE FIXME TODO all of this bloom stuff will be refactored into the per-state settings screen
                 Serial.printf(
                     "FakeBloom %s from %.2f%% to %.2f%%.\n", 
                     ((bloomChanged > 0) ? "increased" : "decreased"), 
-                    (N::display::bloomScale - bloomChanged) * 100, N::display::bloomScale * 100
+                    (N::DRAW::bloomScale - bloomChanged) * 100, N::DRAW::bloomScale * 100
                 );
-            }
-
-
-            /* Power toggle. */
-            if (IrReceiver.decodedIRData.command == IRConfig::commands::powerToggle) {
-                N::displayOn = !N::displayOn;
-
-                if (N::debug) {
-                    Serial.printf("N display turned %s.\n", (N::displayOn) ? "on" : "off");
-                }
-            }
-
-            /* Cycle mode. */
-            if (IrReceiver.decodedIRData.command == IRConfig::commands::next && N::mode < N::modes::NCFG_M_MAX - 1) {
-                N::mode += 1;
-            } else if (IrReceiver.decodedIRData.command == IRConfig::commands::prev && N::mode > N::modes::NCFG_M_MIN + 1) {
-                N::mode -= 1;
             }
         }
 
+        /* You need this or it locks. */
         IrReceiver.resume();
     }
 
     /* N Drawing w/ SmartMatrix */
     uint32_t curMillis = millis();
 
-    N::display::frame::millisSinceLast = curMillis - N::display::frame::millisLastAt;
-    if (N::display::frame::millisSinceLast > N::display::frame::millisPer - 1) { // Draw frame if it's been a bit.
-        N::display::frame::millisLastAt = curMillis;
-
-        /* TESTING NEW COMPONENTS FIXME */
-        // lcd.clear();
-        // lcd.setCursor(0, 0);
-        // lcd.print("Hello!");
-        // MPUHandler::update();
-        // MPUHandler::printAGD();
+    N::DRAW::frameMillisSinceLast = curMillis - N::DRAW::frameMillisLastAt;
+    if (N::DRAW::frameMillisSinceLast > N::DRAW::frameMillisPer - 1) { // Draw frame if it's been a bit.
+        N::DRAW::frameMillisLastAt = curMillis;
 
         /* Debug print if been too long since last frame. */
-        if (N::debug && N::display::frame::millisSinceLast > N::display::frame::millisPer / N::display::frame::tooSlowAlert) { 
+        if (N::debug && N::DRAW::frameMillisSinceLast > N::DRAW::frameMillisPer / N::DRAW::frameTooSlowAlert) { 
             Serial.printf(
                 "Frame rate dropped dangerously low! "
                 "Alert set at %.2f%%, maximally %u millis per frame. "
                 "Expected close to %u millis since last frame. Has been %u.\n", 
-                N::display::frame::tooSlowAlert*100, 
-                (int)(N::display::frame::millisPer / N::display::frame::tooSlowAlert), 
-                N::display::frame::millisPer, N::display::frame::millisSinceLast
+                N::DRAW::frameTooSlowAlert*100, 
+                (int)(N::DRAW::frameMillisPer / N::DRAW::frameTooSlowAlert), 
+                N::DRAW::frameMillisPer, N::DRAW::frameMillisLastAt
             ); 
         }
+
+        /* Update accelerometer. */
+        N::MPU::update();
+
+        /* Draw LCD. */
+        N::LCD::lcd.clear();
+        N::LCD::lcd.print(millis());
 
         /* Draw frame. */
         backgroundLayer.fillScreen(defaultBackgroundColor);
@@ -498,28 +507,28 @@ void loop() {
         /* Case per mode. */
         switch (N::mode) {
             case (N::modes::NCFG_M_KNOCKEDTFOUT): { // baked still image example
-                DrawArgs args_alt = DrawArgs_DEFAULT;
+                N::DRAW::DrawArgs args_alt = DrawArgs_DEFAULT;
                 args_alt.glitches.jitter = { .enabled = true, .chance = 0.02f, .magnitude = 3 };
                 args_alt.glitches.desaturate = { .enabled = true, .chance = 0.02f, .magnitude = 80 };
                 args_alt.glitches.fail = { .enabled = true, .chance = 0.02f };
                 args_alt.glitches.chromatic = { .enabled = true, .chance = 0.02f, .magnitude = 80 };
-                DrawHandler::drawFromRAM(args_alt, (uint8_t *)knockedtfout_png, (int)knockedtfout_png_len);
+                N::DRAW::drawFromRAM(args_alt, (uint8_t *)knockedtfout_png, (int)knockedtfout_png_len);
                 break;
             }
 
             case (N::modes::NCFG_M_TEST_CARD): { // animation on sd card example
-                DrawArgs args_alt = DrawArgs_DEFAULT;
-                DrawHandler::drawFromRAM(args_alt, (uint8_t *)test_card_png, (int)test_card_png_len);
+                N::DRAW::DrawArgs args_alt = DrawArgs_DEFAULT;
+                N::DRAW::drawFromRAM(args_alt, (uint8_t *)test_card_png, (int)test_card_png_len);
                 break;
             }
 
             case (N::modes::NCFG_M_TEST_ANIM): { // animation on sd card with transparency and layers example
-                DrawArgs args_alt = DrawArgs_DEFAULT;
+                N::DRAW::DrawArgs args_alt = DrawArgs_DEFAULT;
                 args_alt.drawBlack = false;
                 args_alt.mixBlack = false;
 
-                testSpeed.drawNextFrame(DrawArgs_DEFAULT);
-                testSuite.drawNextFrame(args_alt);
+                N::ANIM::testSpeed.drawNextFrame(DrawArgs_DEFAULT);
+                N::ANIM::testSuite.drawNextFrame(args_alt);
                 break;
             }
     
